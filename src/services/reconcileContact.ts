@@ -6,8 +6,8 @@ interface IdentifyInput {
 }
 
 export async function reconcileContact({ email, phoneNumber }: IdentifyInput) {
-  // Find matching contacts
-  const existingContacts = await prisma.contact.findMany({
+  //Find direct matches
+  const matches = await prisma.contact.findMany({
     where: {
       deletedAt: null,
       OR: [
@@ -15,13 +15,10 @@ export async function reconcileContact({ email, phoneNumber }: IdentifyInput) {
         ...(phoneNumber ? [{ phoneNumber }] : []),
       ],
     },
-    orderBy: {
-      createdAt: "asc",
-    },
   });
 
-  // If none → create primary
-  if (existingContacts.length === 0) {
+  // If no matches → create new primary
+  if (matches.length === 0) {
     const newContact = await prisma.contact.create({
       data: {
         email,
@@ -38,53 +35,93 @@ export async function reconcileContact({ email, phoneNumber }: IdentifyInput) {
     };
   }
 
-  // Oldest becomes primary
-  const primary = existingContacts[0]!;
+  //Collect all root primary IDs
+  const rootIds = new Set<number>();
 
+  for (const contact of matches) {
+    if (contact.linkPrecedence === "primary") {
+      rootIds.add(contact.id);
+    } else if (contact.linkedId) {
+      rootIds.add(contact.linkedId);
+    }
+  }
+
+  // Fetch entire cluster
+  const cluster = await prisma.contact.findMany({
+    where: {
+      deletedAt: null,
+      OR: [
+        { id: { in: Array.from(rootIds) } },
+        { linkedId: { in: Array.from(rootIds) } },
+      ],
+    },
+    orderBy: {
+      createdAt: "asc",
+    },
+  });
+
+  // Determine true primary (oldest primary)
+  const primaries = cluster.filter(c => c.linkPrecedence === "primary");
+
+  const truePrimary = primaries[0]!; // because ordered by createdAt asc
+
+  // Demote other primaries
+  for (const primary of primaries) {
+    if (primary.id !== truePrimary.id) {
+      await prisma.contact.update({
+        where: { id: primary.id },
+        data: {
+          linkPrecedence: "secondary",
+          linkedId: truePrimary.id,
+        },
+      });
+    }
+  }
+
+  //Check if new info needs secondary creation
   const existingEmails = new Set(
-    existingContacts.map((c) => c.email).filter(Boolean)
+    cluster.map(c => c.email).filter(Boolean)
   );
 
   const existingPhones = new Set(
-    existingContacts.map((c) => c.phoneNumber).filter(Boolean)
+    cluster.map(c => c.phoneNumber).filter(Boolean)
   );
 
   const isNewEmail = email && !existingEmails.has(email);
   const isNewPhone = phoneNumber && !existingPhones.has(phoneNumber);
 
-  // Create secondary if new info
   if (isNewEmail || isNewPhone) {
     await prisma.contact.create({
       data: {
         email,
         phoneNumber,
-        linkedId: primary.id,
         linkPrecedence: "secondary",
+        linkedId: truePrimary.id,
       },
     });
   }
 
-  // Fetch full group
+  //Re-fetch final cluster (IMPORTANT)
   const finalContacts = await prisma.contact.findMany({
     where: {
       deletedAt: null,
       OR: [
-        { id: primary.id },
-        { linkedId: primary.id },
+        { id: truePrimary.id },
+        { linkedId: truePrimary.id },
       ],
     },
   });
 
   return {
-    primaryId: primary.id,
+    primaryId: truePrimary.id,
     emails: [
-      ...new Set(finalContacts.map((c) => c.email).filter(Boolean)),
+      ...new Set(finalContacts.map(c => c.email).filter(Boolean)),
     ],
     phoneNumbers: [
-      ...new Set(finalContacts.map((c) => c.phoneNumber).filter(Boolean)),
+      ...new Set(finalContacts.map(c => c.phoneNumber).filter(Boolean)),
     ],
     secondaryIds: finalContacts
-      .filter((c) => c.linkPrecedence === "secondary")
-      .map((c) => c.id),
+      .filter(c => c.linkPrecedence === "secondary")
+      .map(c => c.id),
   };
 }
